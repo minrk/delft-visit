@@ -17,9 +17,7 @@ import sys
 from traitlets import Unicode, Integer
 
 import nbformat
-from nbformat.v4 import new_code_cell
 from nbconvert.preprocessors import ExecutePreprocessor
-from jupyter_client.manager import start_new_kernel
 
 
 class OutputCache(dict):
@@ -63,6 +61,8 @@ class OutputCache(dict):
         with io.open(self._path(key), 'w', encoding='utf8') as f:
             json.dump(value, f)
 
+from collections import namedtuple
+setup_cell = namedtuple('setup_cell', ('index', 'cell'))
 
 class CachedOutputPreprocessor(ExecutePreprocessor):
     """NbConvert preprocessor that caches output
@@ -85,9 +85,13 @@ class CachedOutputPreprocessor(ExecutePreprocessor):
         
         Includes hash of setup code (if cell is not part of the setup itself)
         """
-        if cell_index > self.end_setup_index and self.setup:
-            source = '\n'.join(self.setup + [source])
-        return sha1(source.encode('utf8')).hexdigest()
+        sources = []
+        for idx, cell in self.setup:
+            if idx >= cell_index:
+                break
+            sources.append(cell.source)
+        sources.append(source)
+        return sha1('\n'.join(sources).encode('utf8')).hexdigest()
     
     def preprocess(self, nb, resources):
         self.cache = OutputCache(self.cache_directory)
@@ -99,11 +103,12 @@ class CachedOutputPreprocessor(ExecutePreprocessor):
             if len(self.setup) >= self.setup_cells:
                 break
             if cell.cell_type == 'code':
-                self.setup.append(cell.source)
+                self.setup.append(setup_cell(idx, cell))
         
         self.end_setup_index = idx
+        self.setup_to_run = list(self.setup)
         # skip one level of super
-        return super(ExecutePreprocessor, self).preprocess(nb, resources)
+        return super(CachedOutputPreprocessor, self).preprocess(nb, resources)
     
     def preprocess_cell(self, cell, resources, cell_index):
         if cell.cell_type != 'code':
@@ -119,28 +124,16 @@ class CachedOutputPreprocessor(ExecutePreprocessor):
         return cell, resources
     
     def run_cell(self, cell, cell_index):
-        """Run a single cell"""
-        self.log.info("Executing cell %s with kernel: %s", cell_index, self.kernel_name)
-        self.km, self.kc = start_new_kernel(
-            kernel_name=self.kernel_name,
-            extra_arguments=self.extra_arguments,
-            stderr=open(os.devnull, 'w'),
-            cwd=self.kernel_path)
-        self.kc.allow_stdin = False
-        try:
-            if cell_index >= self.end_setup_index:
-                setup_cell = new_code_cell(source='\n'.join(self.setup))
-            else:
-                # FIXME: indices will be wrong when non-code cells exist
-                idx = self.setup.index(cell.source)
-                setup_cell = new_code_cell(source='\n'.join(self.setup[:idx]))
-            run_cell = super(CachedOutputPreprocessor, self).run_cell
-            if setup_cell.source:
+        """Run a single cell, including setup if needed"""
+        run_cell = super(CachedOutputPreprocessor, self).run_cell
+        while self.setup_to_run:
+            idx, setup_cell = self.setup_to_run.pop(0)
+            if idx < cell_index:
                 run_cell(setup_cell)
-            return run_cell(cell)
-        finally:
-            self.kc.stop_channels()
-            self.km.shutdown_kernel(now=True)
+            if idx == cell_index:
+                # The current cell is part of setup
+                return run_cell(cell)
+        return run_cell(cell)
 
 def main():
     import logging
